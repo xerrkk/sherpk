@@ -1,0 +1,106 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/reboot.h>
+#include <sys/wait.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+
+/* Clean power functions */
+void poweroff(int sig) { 
+    printf("** %s... **\n", "Shutting down");
+    reboot(RB_POWER_OFF); 
+}
+
+void restart(int sig)  { 
+    printf("** %s... **\n", "Rebooting");
+    reboot(RB_AUTOBOOT); 
+}
+
+/* Helper to run a command and wait for it */
+void run(char *cmd, char *args[]) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execv(cmd, args);
+        _exit(1);
+    }
+    waitpid(pid, NULL, 0);
+}
+
+int main() {
+    if (getpid() != 1) return 1;
+
+    /* 1. Environment & Signals */
+    clearenv();
+    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin", 1);
+    setenv("TERM", "linux", 1);
+
+    signal(SIGUSR1, poweroff);
+    signal(SIGINT,  restart);
+    reboot(RB_DISABLE_CAD);
+
+    printf("** %s... **\n", "Booting Sanity Standalone");
+
+    /* 2. Virtual Filesystems */
+    printf("** %s... **\n", "Mounting /proc and /sys");
+    mount("proc", "/proc", "proc", 0, NULL);
+    mount("sysfs", "/sys", "sysfs", 0, NULL);
+    
+    mkdir("/run", 0755);
+    mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=32M");
+
+    /* 3. UDEV - The Keyboard Fix */
+    printf("** %s... **\n", "Starting udevd");
+    pid_t udev_pid = fork();
+    if (udev_pid == 0) {
+        char *udev_args[] = {"/sbin/udevd", "--daemon", NULL};
+        execv("/sbin/udevd", udev_args);
+        _exit(1);
+    }
+    /* Give udevd a moment to initialize */
+    sleep(1); 
+
+    printf("** %s... **\n", "Triggering hardware scan");
+    char *trigger_args[] = {"/sbin/udevadm", "trigger", "--action=add", NULL};
+    run("/sbin/udevadm", trigger_args);
+
+    printf("** %s... **\n", "Waiting for devices to settle");
+    char *settle_args[] = {"/sbin/udevadm", "settle", NULL};
+    run("/sbin/udevadm", settle_args);
+
+    /* 4. Filesystem Logic */
+    printf("** %s... **\n", "Remounting root read-write");
+    mount(NULL, "/", NULL, MS_REMOUNT, NULL);
+
+    /* 5. Network Loopback */
+    printf("** %s... **\n", "Initializing loopback");
+    char *lo_args[] = {"/sbin/ifconfig", "lo", "127.0.0.1", "up", NULL};
+    run("/sbin/ifconfig", lo_args);
+
+    /* 6. Supervisory Loop */
+    printf("** %s... **\n", "Launching Getty");
+    pid_t getty_pid = -1;
+
+    while (1) {
+        if (getty_pid == -1) {
+            getty_pid = fork();
+            if (getty_pid == 0) {
+                char *agetty_args[] = {"/sbin/agetty", "--noclear", "tty1", "115200", "linux", NULL};
+                execv("/sbin/agetty", agetty_args);
+                _exit(1);
+            }
+        }
+
+        int status;
+        pid_t reaped = wait(&status);
+
+        if (reaped == getty_pid) {
+            printf("** %s... **\n", "Getty exited. Respawning");
+            getty_pid = -1;
+            sleep(1); 
+        } 
+    }
+
+    return 0;
+}
