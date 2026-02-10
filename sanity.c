@@ -19,12 +19,14 @@
 /* --- Power Management & Solaris-style Kill --- */
 
 void kill_the_world() {
+    sync();
     printf("\n** Sending SIGTERM to all processes... **\n");
     kill(-1, SIGTERM);
     sleep(2);
     printf("** Sending SIGKILL to all processes... **\n");
     kill(-1, SIGKILL);
     sync();
+    mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL);
 }
 
 void poweroff(int sig) {
@@ -34,7 +36,7 @@ void poweroff(int sig) {
 }
 
 void restart(int sig)  {
-    printf("\n** The system is going UP now... **\n");
+    printf("\n** The system is going DOWN \'n then UP now... **\n");
     kill_the_world();
     reboot(RB_AUTOBOOT);
 }
