@@ -8,7 +8,7 @@
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        printf("Usage: %s [reboot|off|die|enable <script>|disable <script>]\n", progname);
+        printf("Usage: erkl [reboot|off|die|enable <script>|disable <script>]\n");
         return 1;
     }
 
