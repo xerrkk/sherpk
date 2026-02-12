@@ -13,79 +13,73 @@
 #include <fcntl.h>
 #include <errno.h>
 
-#define FIFO_PATH "/run/gni.fifo"
+#define FIFO_PATH "/run/sherpk.fifo"
 
-/* --- Power Management & Cleanup --- */
+/* --- Power Management --- */
 
 void kill_the_world() {
     sync();
-    printf("\n[GNI] Sending SIGTERM to all processes...\n");
+    printf("\n** Terminating all processes... **\n");
     kill(-1, SIGTERM);
     sleep(2);
-    printf("[GNI] Sending SIGKILL to all processes...\n");
     kill(-1, SIGKILL);
     sync();
-    // Remount root read-only to prevent filesystem corruption on Ivy Bridge SSD/HDD
+    // Ivy Bridge / SSD Safety: Final flush and remount RO
     mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL);
 }
 
-void poweroff(int sig) {
-    printf("\n[GNI] Powering off...\n");
+void poweroff_handler(int sig) {
     kill_the_world();
     reboot(RB_POWER_OFF);
 }
 
-void restart(int sig)  {
-    printf("\n[GNI] Rebooting system...\n");
+void reboot_handler(int sig) {
     kill_the_world();
     reboot(RB_AUTOBOOT);
 }
 
-/* --- Core Initialization --- */
+/* --- System Prep --- */
 
 void setup_api_filesystems() {
-    printf("[GNI] Mounting API filesystems...\n");
+    printf("** Mounting kernel API filesystems... **\n");
     mount("proc", "/proc", "proc", 0, NULL);
     mount("sysfs", "/sys", "sysfs", 0, NULL);
     
-    // Create and mount /run as tmpfs for the FIFO and other volatile data
     mkdir("/run", 0755);
     mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=32M");
-    
-    // Setup devpts for terminal support
+
     mkdir("/dev/pts", 0755);
     mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "gid=5,mode=620");
 }
 
-/* --- Guile VM Handoff & Supervisor Loop --- */
+/* --- The Guile/Supervisor Core --- */
 
 static void inner_main(void *closure, int argc, char **argv) {
-    printf("\n[GNI] GNI's Not Init: Guile VM Online.\n");
-    
-    /* 1. Execute the Master Scheme Director */
-    if (access("/etc/gni.scm", R_OK) == 0) {
-        scm_c_primitive_load("/etc/gni.scm");
+    printf("[SHERPK] Entering Guile VM...\n");
+
+    /* Load the Master Script */
+    if (access("/etc/sherpk.scm", R_OK) == 0) {
+        scm_c_primitive_load("/etc/sherpk.scm");
     } else {
-        printf("[GNI] ERROR: /etc/gni.scm not found! Dropping to emergency shell...\n");
+        printf("** /etc/sherpk.scm missing! /bin/sh? **\n");
         system("/bin/sh");
     }
 
     int fifo_fd = *(int *)closure;
     pid_t getty_pid = -1;
 
-    /* 2. The Supervisor Loop */
+    /* Supervisor Loop */
     while (1) {
-        /* Check IPC FIFO for commands (non-blocking) */
+        // 1. Check IPC for commands
         char buf[64];
         ssize_t cmd_len = read(fifo_fd, buf, sizeof(buf) - 1);
         if (cmd_len > 0) {
             buf[cmd_len] = '\0';
-            if (strncmp(buf, "reboot", 6) == 0) restart(0);
-            if (strncmp(buf, "halt", 4) == 0) poweroff(0);
-            if (strncmp(buf, "off", 3) == 0) poweroff(0);
+            if (strstr(buf, "reboot")) reboot_handler(0);
+            if (strstr(buf, "halt") || strstr(buf, "off")) poweroff_handler(0);
         }
 
-        /* Keep a login shell alive on TTY1 */
+        // 2. Keep TTY1 Alive (The Shepherd's Watch)
         if (getty_pid <= 0) {
             getty_pid = fork();
             if (getty_pid == 0) {
@@ -101,50 +95,44 @@ static void inner_main(void *closure, int argc, char **argv) {
             }
         }
 
-        /* The Sub-Reaper: Clean up all orphaned/zombie processes */
+        // 3. Sub-Reaper: Clean up zombies
         int status;
         pid_t reaped;
         while ((reaped = waitpid(-1, &status, WNOHANG)) > 0) {
             if (reaped == getty_pid) {
-                printf("[GNI] TTY1 exited. Respawning...\n");
+                printf("** Teletype 1 died. Restarting... **\n");
                 getty_pid = -1;
             }
         }
 
-        // 100ms sleep to keep Ivy Bridge CPU usage at ~0%
-        usleep(100000); 
+        usleep(100000); // 100ms duty cycle
     }
 }
 
-/* --- Entry Point --- */
+/* --- Entry --- */
 
 int main(int argc, char **argv) {
-    // Only allow running as PID 1
     if (getpid() != 1) {
-        fprintf(stderr, "GNI must be run as PID 1.\n");
+        fprintf(stderr, "** Must be ran as PID 1. **\n");
         return 1;
     }
 
-    /* Bootstrap Hardware & FS */
     setup_api_filesystems();
-    mount(NULL, "/", NULL, MS_REMOUNT, NULL); // Ensure root is RW
+    mount(NULL, "/", NULL, MS_REMOUNT, NULL); // Go RW
 
-    /* Setup Signals */
-    signal(SIGUSR1, poweroff);
-    signal(SIGINT,  restart); // Handle Ctrl-Alt-Del
-    reboot(RB_DISABLE_CAD);   // Let us handle the signal ourselves
+    // Signal Management
+    signal(SIGUSR1, poweroff_handler);
+    signal(SIGINT,  reboot_handler); // Ctrl-Alt-Del
+    reboot(RB_DISABLE_CAD);
 
-    /* Setup IPC FIFO */
+    // IPC Setup
     unlink(FIFO_PATH);
-    if (mkfifo(FIFO_PATH, 0600) == -1) {
-        perror("[GNI] Failed to create FIFO");
-    }
+    mkfifo(FIFO_PATH, 0600);
     int fifo_fd = open(FIFO_PATH, O_RDONLY | O_NONBLOCK);
 
-    printf("\n[GNI] GNI's Not Init v1.0 starting up...\n");
+    printf("\n** Sherpk - a fine man\'s init **\n");
 
-    /* Boot the Guile VM and jump to inner_main */
     scm_boot_guile(argc, argv, inner_main, &fifo_fd);
 
-    return 0; // Never reached
+    return 0; 
 }
